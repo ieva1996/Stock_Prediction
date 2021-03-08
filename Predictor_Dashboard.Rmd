@@ -1,0 +1,479 @@
+---
+title: "Stock Predictor"
+output: flexdashboard::flex_dashboard
+---
+
+```{r}
+library(DT)
+library(flexdashboard)
+library(flextable)
+library(forecast)
+library(timetk)
+library(sweep)
+library(forecast)
+library(tidyquant)
+library(tidyverse)
+library(LINselect)
+library(tsoutliers)
+library(expsmooth)
+library(fma)
+library(vars)
+library(aTSA)
+library(xts)
+library(forecast)
+library(fma)
+library(expsmooth)
+library(lmtest)
+library(tseries)
+library(Quandl)
+library(fpp);
+library(urca)
+library(GMDH)
+library(dygraphs)
+```
+
+```{r}
+########################## Tingo  ###############################
+tingo_key<-"e2f8a116006a88ab198bd1f00d88c7ded77ff32f"  #Self Provided
+```
+
+```{r}
+##########################   NNETAR Parameters  ###################
+Years_Forecast_History<-3
+L <-2 #short term forecast horizon
+STFH<-L
+RPT <-100 #Repeats
+decay_N<-.01  #Low Decay
+S_N<-8
+PATHS<-2000
+length_analysis_short_term <-Years_Forecast_History * 252
+```
+
+```{r}
+##########################  Functions   #############################
+
+### Get High from Stocks
+
+get_high_R<-function(g) {
+  g <-as.xts(g)
+  LE <-nrow(g)
+  SE <-LE- length_analysis_short_term
+  g <-as.numeric(g[SE:LE,2])
+  g<- na.fill(g, fill = 0)
+  g[is.nan(g)] <- 0
+  return(g) 
+}
+
+### Get Low from Stocks
+
+get_low_R<-function(g) {
+  g <-as.xts(g)
+  LE <-nrow(g)
+  SE <-LE- length_analysis_short_term
+  g <-as.numeric(g[SE:LE,3])
+  g<- na.fill(g, fill = 0)
+  g[is.nan(g)] <- 0
+  return(g) 
+}
+
+### GMDH Prediction
+
+GMDHForecast <- function(x, L, LVL, I, LYR,WHT){
+  x<-as.ts(x)
+  fc <- GMDH::fcast(x, method = "RGMDH", input = I, layer = LYR, f.number = L,
+                    level = LVL, tf = "all", weight = WHT, lambda = c(0, 0.01, 0.02, 0.04, 0.08, 0.16,
+                                                                      0.32, 0.64, 1.28, 2.56, 5.12, 10.24))
+  # GMDH doesn't produce a ts object with correct attributes, so we build it
+  end <- tsp(x)[2]
+  freq <- frequency(x)
+  # Set the correct start, end, and frequency for the ts forecast object
+  tsProperties <- c(end + 1 / freq, end + L / freq, freq)
+  tsp(fc$mean) <- tsProperties
+  tsp(fc$upper) <- tsProperties
+  tsp(fc$lower) <- tsProperties
+  class(fc) <- "forecast"
+  return(fc)
+}
+
+### GMDH Accuracy
+GMDH_ACC <- function(out.HIGH, out.LOW){
+  acc<-accuracy(out.HIGH)
+  MAPE_High_GMDH <-acc[5]  #MAPE
+  
+  acc<-accuracy(out.LOW)
+  MAPE_LOW_GMDH <-acc[5]  #MAPE
+  
+  ### Results GMDH
+  accuracy_results_GMDH <-data.frame(MAPE_LOW_GMDH, MAPE_High_GMDH)/100
+  colnames(accuracy_results_GMDH)<-c("MAPE_Low_GMDH", "MAPE_High_GMDH")
+  accuracy_results_GMDH$MAPE_Low_GMDH <-accuracy_results[1] * mean(as.numeric((out.LOW$mean)))
+  accuracy_results_GMDH$MAPE_High_GMDH<-accuracy_results[2] * mean(as.numeric((out.HIGH$mean)))
+  print(accuracy_results_GMDH)
+  
+  gmdh_high<-as.numeric(out.HIGH$mean) - accuracy_results_GMDH$MAPE_High_GMDH
+  gmdh_high<-round(gmdh_high, digits=2)
+  colnames(gmdh_high)<-c("gmdh_forecast_high")
+  
+  gmdh_low<-as.numeric(out.LOW$mean) + accuracy_results_GMDH$MAPE_Low_GMDH
+  gmdh_low<-round(gmdh_low, digits=2)
+  colnames(gmdh_low)<-c("gmdh_forecast_low")
+  
+  gmdh_pred<-data.frame(gmdh_low,gmdh_high)
+  
+  return(gmdh_pred)
+}
+
+
+### Main Function
+
+Stock_Predict <- function(x){
+  
+options(digits=4)
+symb <-x
+a<-getSymbols(symb, src="tiingo", api.key=tingo_key, auto.assign = FALSE)
+
+x<-as.numeric(a[1:30,1]) 
+adf_test <-tseries::adf.test(x)
+p_value <-ifelse(adf_test$p.value < .05,"Stationary","Not_Stationary")
+
+
+HIGH     <-get_high_R(a)
+LOW     <-get_low_R(a)
+
+###NNETAR_High
+TFIT <-auto.arima(HIGH,test="adf")
+FIT <-fitted(TFIT, type="regression")
+FCAST <-forecast::forecast(TFIT, h=L)
+FCAST <-data.frame(FCAST)
+CVA_ARF_H <-as.numeric(FCAST[,1])
+
+FIT <- nnetar(HIGH, size=S_N, repeats = RPT, xreg = FIT, decay = decay_N, lambda = BoxCox.lambda(HIGH))
+fit_cv <- CVar(LOW,  size=2)
+SD <- sd(fit_cv$residuals, na.rm=TRUE)
+myinnovs <- rnorm(STFH*PATHS, mean= 0, sd=SD)
+FCAST<- forecast::forecast(FIT, h=L ,PI=TRUE, xreg = CVA_ARF_H, npaths=PATHS, innov=myinnovs)
+
+
+acc<-accuracy(FIT)
+MAPE_High <-acc[5]  #MAPE
+fcast_NNETAR_high <-data.frame(FCAST)
+
+
+
+###NNETAR_LOW
+TFIT <-auto.arima(LOW,test="adf")
+FIT <-fitted(TFIT, type="regression")
+FCAST <-forecast::forecast(TFIT, h=L)
+FCAST <-data.frame(FCAST)
+CVA_ARF_L <-as.numeric(FCAST[,1])
+
+FIT<- nnetar(LOW, size=S_N, repeats = RPT, xreg = FIT, decay = decay_N, lambda = BoxCox.lambda(LOW))
+fit_cv <- CVar(LOW,  size=2)
+SD<- sd(fit_cv$residuals, na.rm=TRUE)
+myinnovs <- rnorm(STFH*PATHS, mean= 0, sd=SD)
+FCAST<- forecast::forecast(FIT, h=L, PI=TRUE, xreg = CVA_ARF_L, npaths=PATHS, innov=myinnovs)
+
+acc<-accuracy(FIT)
+MAPE_LOW <-acc[5]  #MAPE
+
+fcast_NNETAR_low <-data.frame(FCAST)
+
+### Results AAL
+accuracy_results <-data.frame(MAPE_LOW, MAPE_High)/100
+colnames(accuracy_results)<-c("MAPE_Low", "MAPE_High")
+accuracy_results$Error_Low<-accuracy_results$MAPE_Low * mean(fcast_NNETAR_low$Point.Forecast)
+accuracy_results$Error_High <-accuracy_results$MAPE_High * mean(fcast_NNETAR_high$Point.Forecast)
+
+out.HIGH <-GMDHForecast(HIGH, L, 80, 15, 5, .9)
+out.LOW <-GMDHForecast(LOW, L, 80, 15, 5, .9)
+
+
+gmdh_point_high<-as.numeric(out.HIGH$mean)
+gmdh_point_low<-as.numeric(out.LOW$mean)
+point_low<-fcast_NNETAR_low$Point.Forecast
+point_high<-fcast_NNETAR_high$Point.Forecast
+
+daily_low<-rbind(gmdh_point_low + point_low)/2
+daily_high<-rbind(gmdh_point_high + point_high)/2
+
+tmp<-rbind(daily_low,daily_high)
+tmp<-round(tmp, digits=2)
+name_space <-t(data.frame("Daily_Low","Daily_High"))
+rownames(name_space)<-c()
+
+df<-data.frame(name_space,tmp)
+
+df1<-t(data.frame(accuracy_results$MAPE_Low,accuracy_results$MAPE_High)) *100
+rownames(df1)<-c()
+df1<-round(df1, digits=2)
+
+df2<-t(data.frame(accuracy_results$Error_Low,accuracy_results$Error_High))
+rownames(df2)<-c()
+df2<-round(df2, digits=2)
+
+
+df3<-t(data.frame(symb,symb))
+rownames(df3)<-c()
+
+df4<-t(data.frame(p_value,p_value))
+rownames(df4)<-c()
+
+
+
+df<-data.frame(df3,df,df1,df2,df4)
+rownames(df)<-c()
+colnames(df)<-c("Stock","Prediction_Type","Next_24","Next_48","MAPE","Apply_Error_Value","Stationary?")
+
+df_rtn<-data.frame(df)
+  
+  return(df_rtn)
+}
+
+```
+
+Page 1 {data-navmenu="EVC"}
+==================
+    
+### EVC
+
+```{r warnings=FALSE, include=FALSE}
+DF_EVC<-Stock_Predict("EVC")
+```
+    
+```{r warnings=FALSE}
+datatable(DF_EVC)
+```
+
+### EVC Chart
+```{r warnings=FALSE}
+getSymbols("EVC", src="tiingo", api.key=tingo_key)
+options(scipen=999)
+dygraph(OHLC(EVC), main = "Historical Data") %>% 
+dyRangeSelector()
+```   
+
+
+
+Page 2 {data-navmenu="SALM"}
+=====================================     
+
+### SALM
+    
+```{r warnings=FALSE, include=FALSE}
+DF_SALM<-Stock_Predict("SALM")
+
+```
+    
+```{r warnings=FALSE}
+datatable(DF_SALM)
+```
+
+### SALM Chart
+```{r warnings=FALSE}
+getSymbols("SALM", src="tiingo", api.key=tingo_key)
+options(scipen=999)
+dygraph(OHLC(SALM), main = "Historical Data") %>% 
+dyRangeSelector()
+``` 
+
+Page 3 {data-navmenu="AAL"}
+=====================================     
+
+### AAL
+    
+```{r warnings=FALSE, include=FALSE}
+DF_AAL<-Stock_Predict("AAL")
+
+```
+    
+```{r warnings=FALSE}
+datatable(DF_AAL)
+```
+
+### AAL Chart
+```{r warnings=FALSE}
+getSymbols("AAL", src="tiingo", api.key=tingo_key)
+options(scipen=999)
+dygraph(OHLC(AAL), main = "Historical Data") %>% 
+dyRangeSelector()
+```  
+
+Page 4 {data-navmenu="F"}
+=====================================     
+
+### F
+    
+```{r warnings=FALSE, include=FALSE}
+DF_F<-Stock_Predict("F")
+
+```
+    
+```{r warnings=FALSE}
+datatable(DF_F)
+```
+
+### F Chart
+```{r warnings=FALSE}
+getSymbols("F", src="tiingo", api.key=tingo_key)
+options(scipen=999)
+dygraph(OHLC(F), main = "Historical Data") %>% 
+dyRangeSelector()
+``` 
+
+
+Page 5 {data-navmenu="SMCI"}
+=====================================     
+
+### SLGG
+    
+```{r warnings=FALSE, include=FALSE}
+DF_SMCI<-Stock_Predict("SMCI")
+
+```
+    
+```{r warnings=FALSE}
+datatable(DF_SMCI)
+```
+
+### SMCI Chart
+```{r warnings=FALSE}
+getSymbols("SMCI", src="tiingo", api.key=tingo_key)
+options(scipen=999)
+dygraph(OHLC(SMCI), main = "Historical Data") %>% 
+dyRangeSelector()
+```  
+
+
+Page 6 {data-navmenu="DHT"}
+=====================================     
+
+### DHT
+    
+```{r warnings=FALSE, include=FALSE}
+DF_DHT<-Stock_Predict("DHT")
+
+```
+    
+```{r warnings=FALSE}
+datatable(DF_DHT)
+```
+
+### DHT Chart
+```{r warnings=FALSE}
+getSymbols("DHT", src="tiingo", api.key=tingo_key)
+dygraph(OHLC(DHT), main = "Historical Data") %>% 
+dyRangeSelector()
+``` 
+
+
+Page 7 {data-navmenu="FSM"}
+=====================================     
+
+### FSM
+    
+```{r warnings=FALSE, include=FALSE}
+DF_FSM<-Stock_Predict("FSM")
+```
+    
+```{r warnings=FALSE}
+datatable(DF_FSM)
+```
+
+### FSM Chart
+```{r warnings=FALSE}
+getSymbols("FSM", src="tiingo", api.key=tingo_key)
+options(scipen=999)
+dygraph(OHLC(FSM), main = "Historical Data") %>% 
+dyRangeSelector()
+``` 
+
+Page 8 {data-navmenu="CIK"}
+=====================================     
+
+### CIK
+    
+```{r warnings=FALSE, include=FALSE}
+DF_CIK<-Stock_Predict("CIK")
+
+```
+    
+```{r warnings=FALSE}
+datatable(DF_CIK)
+```
+
+### CIK Chart
+```{r warnings=FALSE}
+getSymbols("CIK", src="tiingo", api.key=tingo_key)
+options(scipen=999)
+dygraph(OHLC(CIK), main = "Historical Data") %>% 
+dyRangeSelector()
+``` 
+
+
+Page 9 {data-navmenu="CVA"}
+=====================================     
+
+### CVA
+    
+```{r warnings=FALSE, include=FALSE}
+DF_CVA<-Stock_Predict("CVA")
+```
+    
+```{r warnings=FALSE}
+datatable(DF_CVA)
+```
+
+### CVA Chart
+```{r warnings=FALSE}
+getSymbols("CVA", src="tiingo", api.key=tingo_key)
+options(scipen=999)
+dygraph(OHLC(CVA), main = "Historical Data") %>% 
+dyRangeSelector()
+```
+
+
+Page 10 {data-navmenu="LUB"}
+=====================================     
+
+### LUB
+    
+```{r warnings=FALSE, include=FALSE}
+DF_LUB<-Stock_Predict("LUB")
+
+```
+    
+```{r warnings=FALSE}
+datatable(DF_LUB)
+```
+
+### LUB Chart
+```{r warnings=FALSE}
+getSymbols("LUB", src="tiingo", api.key=tingo_key)
+options(scipen=999)
+dygraph(OHLC(LUB), main = "Historical Data") %>% 
+dyRangeSelector()
+```
+
+
+Page 11 {data-navmenu="RUN"}
+=====================================     
+
+### RUN
+    
+```{r warnings=FALSE, include=FALSE}
+DF_RUN<-Stock_Predict("RUN")
+
+```
+    
+```{r warnings=FALSE}
+datatable(DF_RUN)
+```
+
+### LUB Chart
+```{r warnings=FALSE}
+getSymbols("RUN", src="tiingo", api.key=tingo_key)
+options(scipen=999)
+dygraph(OHLC(RUN), main = "Historical Data") %>% 
+dyRangeSelector()
+```
+
